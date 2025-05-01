@@ -136,7 +136,13 @@ class FFN(nn.Module):
 # TODO add masking to encoder to skip padding
 # TODO add masking to decoder to skip later tokens
 class MultiheadedAttention(nn.Module):
-    def __init__(self, n, h, d_model, mask=False):
+    def __init__(self, n, h, d_model, key_padding_mask=None, att_mask=False):
+        """
+        Args:
+        key_padding_mask: tensor of size (BATCH_SZ, N, N)
+        att_mask: whether or not illegal connections should be masked
+            This should be set to True in the decoder self-attention block
+        """
         super(MultiheadedAttention, self).__init__()
         self.n = n
         self.h = h
@@ -146,7 +152,8 @@ class MultiheadedAttention(nn.Module):
         self.queries = [nn.Linear(d_model, self.d_q) for i in range(h)]
         self.keys = [nn.Linear(d_model, self.d_k) for i in range(h)]
         self.values = [nn.Linear(d_model, self.d_v) for i in range(h)]
-        self.mask = mask
+        self.key_padding_mask = key_padding_mask
+        self.att_mask = att_mask
 
     def attention(self, Q, K, V):
         """
@@ -158,10 +165,12 @@ class MultiheadedAttention(nn.Module):
         Output: tensor of size (BATCH_SZ, N, D_HEAD)
         """
         QKT = Q.matmul(K.transpose(1, 2))
-        if self.mask:
+        if self.key_padding_mask is not None:
+            QKT = QKT.masked_fill(self.key_padding_mask, -torch.inf)
+
+        if self.att_mask:
             indices = torch.triu_indices(self.n, self.n, offset=1)
             QKT[:, indices[0], indices[1]] = float("-inf")
-
         return (QKT / math.sqrt(self.d_k)).softmax(dim=2).matmul(V)
 
     # NOTE: X_Q = X_K = X_V if self-attention
@@ -182,9 +191,11 @@ class MultiheadedAttention(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, n, h, d_model):
+    def __init__(self, n, h, d_model, key_padding_mask):
         super(EncoderLayer, self).__init__()
-        self.layer1 = MultiheadedAttention(n, h, d_model)
+        self.layer1 = MultiheadedAttention(
+            n, h, d_model, key_padding_mask=key_padding_mask
+        )
         self.add_and_norm1 = AddAndNorm(n, d_model)
         self.layer2 = FFN(n, d_model, d_model * 4)
         self.add_and_norm2 = AddAndNorm(n, d_model)
@@ -202,7 +213,7 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, n, h, d_model, Z_e):
+    def __init__(self, n, h, d_model, Z_e, key_padding_mask):
         """
         Args:
         Z_e: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
@@ -211,9 +222,11 @@ class DecoderLayer(nn.Module):
         super(DecoderLayer, self).__init__()
         self.Z_e = Z_e
 
-        self.layer1 = MultiheadedAttention(n, h, d_model, mask=True)
+        self.layer1 = MultiheadedAttention(
+            n, h, d_model, key_padding_mask=key_padding_mask, att_mask=True
+        )
         self.add_and_norm1 = AddAndNorm(n, d_model)
-        self.layer2 = MultiheadedAttention(n, h, d_model)
+        self.layer2 = MultiheadedAttention(n, h, d_model)  # cross attention
         self.add_and_norm2 = AddAndNorm(n, d_model)
         self.layer3 = FFN(n, d_model, d_model * 4)
         self.add_and_norm3 = AddAndNorm(n, d_model)
@@ -234,10 +247,12 @@ class DecoderLayer(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, n, h, d_model, num_layers):
+    def __init__(self, n, h, d_model, num_layers, key_padding_mask):
         super(Encoder, self).__init__()
         self.pe = PosEnc(n, d_model)
-        self.encoder_layers = [EncoderLayer(n, h, d_model) for i in range(num_layers)]
+        self.encoder_layers = [
+            EncoderLayer(n, h, d_model, key_padding_mask) for i in range(num_layers)
+        ]
 
     def forward(self, X):
         """
@@ -253,7 +268,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, n, h, d_model, num_layers, Z_e):
+    def __init__(self, n, h, d_model, num_layers, Z_e, key_padding_mask):
         """
         Args:
         Z_e: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
@@ -263,7 +278,8 @@ class Decoder(nn.Module):
         self.Z_e = Z_e
         self.pe = PosEnc(n, d_model)
         self.decoder_layers = [
-            DecoderLayer(n, h, d_model, Z_e) for i in range(num_layers)
+            DecoderLayer(n, h, d_model, Z_e, key_padding_mask)
+            for i in range(num_layers)
         ]
 
     def forward(self, X):
@@ -294,13 +310,23 @@ def tokenize_input(t_e: List[str], d_model):
     src_tokens = [torch.tensor(sentence) for sentence in src_tokens]
     max_len = max([sentence.size(0) for sentence in src_tokens])
 
+    # tensor of size (BATCH_SZ, max_len) where element at (i, j) == 1 if padded else 0
+    key_padding_mask = torch.zeros(len(src_tokens), max_len, dtype=torch.bool)
+
+    # list of size BATCH_SZ of tensors of size (max_len)
     padded = [torch.zeros((1, max_len), dtype=int) for i in range(len(src_tokens))]
     for i in range(len(padded)):
         padded[i][:, : src_tokens[i].size(0)] = src_tokens[i]
+        key_padding_mask[i][src_tokens[i].size(0) - 1 :] = 1
+
+    key_padding_mask = key_padding_mask.unsqueeze(1)
+    key_padding_mask = key_padding_mask.expand(-1, max_len, -1)
+
     cat = torch.concat(padded)
+
     src_embedding_fn = Embedding(len(src_vocab) + len(src_base) + 1, d_model)
     src_embeddings = src_embedding_fn(cat)
-    return src_embeddings
+    return (src_embeddings, key_padding_mask)
 
 
 def tokenize_output(t_d: List[str], d_model):
@@ -318,13 +344,23 @@ def tokenize_output(t_d: List[str], d_model):
     tgt_tokens = [torch.tensor(sentence) for sentence in tgt_tokens]
     max_len = max([sentence.size(0) for sentence in tgt_tokens])
 
+    # tensor of size (BATCH_SZ, max_len) where element at (i, j) == 1 if padded else 0
+    key_padding_mask = torch.zeros(len(tgt_tokens), max_len, dtype=torch.bool)
+
+    # list of size BATCH_SZ of tensors of size (max_len)
     padded = [torch.zeros((1, max_len), dtype=int) for i in range(len(tgt_tokens))]
     for i in range(len(padded)):
         padded[i][:, : tgt_tokens[i].size(0)] = tgt_tokens[i]
+        key_padding_mask[i][tgt_tokens[i].size(0) - 1 :] = 1
+
+    key_padding_mask = key_padding_mask.unsqueeze(1)
+    key_padding_mask = key_padding_mask.expand(-1, max_len, -1)
+
     cat = torch.concat(padded)
+
     tgt_embedding_fn = Embedding(len(tgt_vocab) + len(tgt_base) + 1, d_model)
     tgt_embeddings = tgt_embedding_fn(cat)
-    return tgt_embeddings
+    return (tgt_embeddings, key_padding_mask)
 
 
 # TODO(implement)
@@ -333,16 +369,16 @@ def decoder_unembed(Z_d):
 
 
 def simulate(t_e: List[str], t_d: List[str], h, num_layers) -> None:
-    d_model = 512
-    Z_e = tokenize_input(t_e, d_model)
+    d_model = 200
+    Z_e, key_padding_mask = tokenize_input(t_e, d_model)
     n_src = max([sentence.size(0) for sentence in Z_e])
-    encoder = Encoder(n_src, h, d_model, 6)
+    encoder = Encoder(n_src, h, d_model, 6, key_padding_mask)
     Z_e = encoder(Z_e)
 
-    Z_d = tokenize_output(t_d, d_model)
+    Z_d, key_padding_mask = tokenize_output(t_d, d_model)
     n_tgt = Z_d.size(0)
     n_tgt = max([sentence.size(0) for sentence in Z_d])
-    decoder = Decoder(n_tgt, h, d_model, 6, Z_e)
+    decoder = Decoder(n_tgt, h, d_model, 6, Z_e, key_padding_mask)
     Z_d = decoder(Z_d)
 
     out = decoder_unembed(Z_d)
