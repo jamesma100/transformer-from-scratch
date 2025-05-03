@@ -295,7 +295,7 @@ class Decoder(nn.Module):
         return Z_d
 
 
-def tokenize_input(t_e: List[str], d_model):
+def tokenize_input(tokens_path, base_path, vocab_path,  d_model):
     """
     Args:
     t_e: list of sentences, with length BATCH_SZ
@@ -305,8 +305,12 @@ def tokenize_input(t_e: List[str], d_model):
         max length of the token lists (N_SRC) , then converted to an embedding
         of size D_MODEL
     """
-    src_tokenizer = Tokenizer(t_e)
-    src_tokens, src_base, src_vocab = src_tokenizer.encode()
+    with open(tokens_path, "r") as fp:
+        src_tokens = [[int(token) for token in line.split(",")] for line in fp.readlines()]
+    with open(base_path, "r") as fp:
+        src_base = json.load(fp)
+    with open(vocab_path, "r") as fp:
+        src_vocab = json.load(fp)
     src_tokens = [torch.tensor(sentence) for sentence in src_tokens]
     max_len = max([sentence.size(0) for sentence in src_tokens])
 
@@ -329,7 +333,7 @@ def tokenize_input(t_e: List[str], d_model):
     return (src_embeddings, key_padding_mask)
 
 
-def tokenize_output(t_d: List[str], d_model):
+def tokenize_output(tokens_path, base_path, vocab_path, d_model):
     """
     Args:
     t_d: list of sentences, with length BATCH_SZ
@@ -339,8 +343,12 @@ def tokenize_output(t_d: List[str], d_model):
         max length of the token lists (N_SRC) , then converted to an embedding
         of size D_MODEL
     """
-    tgt_tokenizer = Tokenizer(t_d)
-    tgt_tokens, tgt_base, tgt_vocab = tgt_tokenizer.encode()
+    with open(tokens_path) as fp:
+        tgt_tokens = [[int(token) for token in line.split(",")] for line in fp.readlines()]
+    with open(base_path) as fp:
+        tgt_base = json.load(fp)
+    with open(vocab_path) as fp:
+        tgt_vocab = json.load(fp)
     tgt_tokens = [torch.tensor(sentence) for sentence in tgt_tokens]
     max_len = max([sentence.size(0) for sentence in tgt_tokens])
 
@@ -368,49 +376,19 @@ def decoder_unembed(Z_d):
     return Z_d
 
 
-def simulate(t_e: List[str], t_d: List[str], h, num_layers) -> None:
+if __name__ == "__main__":
     d_model = 200
-    Z_e, key_padding_mask = tokenize_input(t_e, d_model)
+    h = 8
+    Z_e, key_padding_mask = tokenize_input("./out/tokens_en.txt", "./out/base_en.json", "./out/vocab_en.json", d_model)
     n_src = max([sentence.size(0) for sentence in Z_e])
     encoder = Encoder(n_src, h, d_model, 6, key_padding_mask)
     Z_e = encoder(Z_e)
 
-    Z_d, key_padding_mask = tokenize_output(t_d, d_model)
+    Z_d, key_padding_mask = tokenize_output("./out/tokens_fr.txt", "./out/base_fr.json", "./out/vocab_fr.json", d_model)
     n_tgt = Z_d.size(0)
     n_tgt = max([sentence.size(0) for sentence in Z_d])
     decoder = Decoder(n_tgt, h, d_model, 6, Z_e, key_padding_mask)
     Z_d = decoder(Z_d)
 
     out = decoder_unembed(Z_d)
-    return out
-
-
-if __name__ == "__main__":
-    de, en = [], []
-    nrows = 50
-    with open("./data/wmt14_translate_de-en_train.csv", encoding="utf-8") as f:
-        data = pd.read_csv(
-            "./data/wmt14_translate_de-en_train.csv", lineterminator="\n", nrows=nrows
-        )
-        for i, row in data.iterrows():
-            de.append(row.iloc[0])
-            en.append(row.iloc[1])
-
-    # src_decoded = src_tokenizer.decode(src_tokens, src_base, src_vocab)
-    # assert src_decoded == de
-    # with open("./out/src_base.json", "w+") as fp:
-    #     json.dump(src_base, fp)
-
-    # with open("./out/src_vocab.json", "w+") as fp:
-    #     json.dump(src_vocab, fp)
-
-    # tgt_decoded = tgt_tokenizer.decode(tgt_tokens, tgt_base, tgt_vocab)
-    # assert tgt_decoded == en
-    # with open("./out/tgt_base.json", "w+") as fp:
-    #     json.dump(tgt_base, fp)
-
-    # with open("./out/tgt_vocab.json", "w+") as fp:
-    #     json.dump(tgt_vocab, fp)
-
-    out = simulate(de, en, 8, 6)
     print("[INFO] final output size: ", out.size())

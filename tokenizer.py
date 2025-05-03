@@ -107,13 +107,14 @@ class Tokenizer:
             print(displ)
     
     
-    def encode(self, max_len=1000):
+    def encode(self, max_len=3000):
         tokens = [[ord(c) for c in l] for l in self.text]
         base, reverse = self._init_vocab(tokens)
         tokens = self._replace(tokens, reverse)
         next_idx = max(base.keys()) + 1
         i = 1
         vocab = {}
+        initial_token_count = sum(len(sentence) for sentence in tokens)
         while len(vocab) < max_len:
             top_pair = self._find_top_pair(tokens)
             if not top_pair:
@@ -122,6 +123,8 @@ class Tokenizer:
             tokens = self._merge(tokens, top_pair, next_idx)
             next_idx += 1
             i += 1
+        final_token_count = sum(len(sentence) for sentence in tokens)
+        print("[INFO] BPE compression ratio: {}".format(final_token_count / initial_token_count))
         return (tokens, base, vocab)
     
     def _decode_token(self, token, base, vocab):
@@ -141,31 +144,40 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    nrows = 50
-    de = []
+    nrows = 200
     en = []
-    with open("./data/wmt14_translate_de-en_train.csv", encoding='utf-8') as f:
-        data = pd.read_csv('./data/wmt14_translate_de-en_train.csv', lineterminator='\n', nrows=nrows)
-        for i, row in data.iterrows():
-            de.append(row[0])
-            en.append(row[1])
+    fr = []
+    data = pd.read_csv('./data/wmt14_translate_fr-en_train_sample.csv', lineterminator='\n', nrows=nrows)
+    for i, row in data.iterrows():
+        en.append(row.iloc[1])
+        fr.append(row.iloc[0])
 
     tokenizer_en = Tokenizer(en)
     tokens_en, base_en, vocab_en = tokenizer_en.encode()
     decoded_en = tokenizer_en.decode(tokens_en, base_en, vocab_en)
     assert decoded_en == en
+
+    with open("./out/tokens_en.txt", "w+") as fp:
+        for tokens in tokens_en:
+            fp.write("{}\n".format(",".join([str(token) for token in tokens])))
+
     with open("./out/base_en.json", "w+") as fp:
         json.dump(base_en, fp)
 
     with open("./out/vocab_en.json", "w+") as fp:
         json.dump(vocab_en, fp)
 
-    tokenizer_de = Tokenizer(de)
-    tokens_de, base_de, vocab_de = tokenizer_de.encode()
-    decoded_de = tokenizer_de.decode(tokens_de, base_de, vocab_de)
-    assert decoded_de == de
-    with open("./out/base_de.json", "w+") as fp:
-        json.dump(base_de, fp)
+    tokenizer_fr = Tokenizer(fr)
+    tokens_fr, base_fr, vocab_fr = tokenizer_fr.encode()
+    decoded_fr = tokenizer_fr.decode(tokens_fr, base_fr, vocab_fr)
+    assert decoded_fr == fr
 
-    with open("./out/vocab_de.json", "w+") as fp:
-        json.dump(vocab_de, fp)
+    with open("./out/tokens_fr.txt", "w+") as fp:
+        for tokens in tokens_fr:
+            fp.write("{}\n".format(",".join([str(token) for token in tokens])))
+
+    with open("./out/base_fr.json", "w+") as fp:
+        json.dump(base_fr, fp)
+
+    with open("./out/vocab_fr.json", "w+") as fp:
+        json.dump(vocab_fr, fp)
