@@ -1,6 +1,5 @@
 from tokenizer import Tokenizer
 from typing import List, Dict
-
 import csv
 import json
 import math
@@ -136,7 +135,7 @@ class FFN(nn.Module):
 # TODO add masking to encoder to skip padding
 # TODO add masking to decoder to skip later tokens
 class MultiheadedAttention(nn.Module):
-    def __init__(self, n, h, d_model, key_padding_mask=None, att_mask=False):
+    def __init__(self, n, h, d_model, att_mask=False):
         """
         Args:
         key_padding_mask: tensor of size (BATCH_SZ, N, N)
@@ -149,10 +148,9 @@ class MultiheadedAttention(nn.Module):
         self.d_q = d_model // h
         self.d_k = d_model // h
         self.d_v = d_model // h
-        self.queries = [nn.Linear(d_model, self.d_q) for i in range(h)]
-        self.keys = [nn.Linear(d_model, self.d_k) for i in range(h)]
-        self.values = [nn.Linear(d_model, self.d_v) for i in range(h)]
-        self.key_padding_mask = key_padding_mask
+        self.queries = nn.ModuleList([nn.Linear(d_model, self.d_q) for i in range(h)])
+        self.keys = nn.ModuleList([nn.Linear(d_model, self.d_k) for i in range(h)])
+        self.values = nn.ModuleList([nn.Linear(d_model, self.d_v) for i in range(h)])
         self.att_mask = att_mask
 
     def attention(self, Q, K, V):
@@ -165,9 +163,6 @@ class MultiheadedAttention(nn.Module):
         Output: tensor of size (BATCH_SZ, N, D_HEAD)
         """
         QKT = Q.matmul(K.transpose(1, 2))
-        if self.key_padding_mask is not None:
-            QKT = QKT.masked_fill(self.key_padding_mask, -torch.inf)
-
         if self.att_mask:
             indices = torch.triu_indices(self.n, self.n, offset=1)
             QKT[:, indices[0], indices[1]] = float("-inf")
@@ -187,15 +182,14 @@ class MultiheadedAttention(nn.Module):
         Ks = [self.keys[i](X_K) for i in range(self.h)]
         Vs = [self.values[i](X_V) for i in range(self.h)]
         heads = [self.attention(Q, K, V) for Q, K, V in zip(Qs, Ks, Vs)]
-        return torch.cat(heads, dim=2)
+        res = torch.cat(heads, dim=2)
+        return res
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, n, h, d_model, key_padding_mask):
+    def __init__(self, n, h, d_model):
         super(EncoderLayer, self).__init__()
-        self.layer1 = MultiheadedAttention(
-            n, h, d_model, key_padding_mask=key_padding_mask
-        )
+        self.layer1 = MultiheadedAttention(n, h, d_model)
         self.add_and_norm1 = AddAndNorm(n, d_model)
         self.layer2 = FFN(n, d_model, d_model * 4)
         self.add_and_norm2 = AddAndNorm(n, d_model)
@@ -203,9 +197,9 @@ class EncoderLayer(nn.Module):
     def forward(self, X):
         """
         Args:
-        X: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
 
-        Output: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
         attention_out = self.add_and_norm1(X, lambda x: self.layer1(x, x, x))
         ffn_out = self.add_and_norm2(attention_out, lambda x: self.layer2(x))
@@ -213,182 +207,156 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, n, h, d_model, Z_e, key_padding_mask):
+    def __init__(self, n, h, d_model):
         """
         Args:
-        Z_e: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
             Represents the output of the encoder
         """
         super(DecoderLayer, self).__init__()
-        self.Z_e = Z_e
 
-        self.layer1 = MultiheadedAttention(
-            n, h, d_model, key_padding_mask=key_padding_mask, att_mask=True
-        )
+        self.layer1 = MultiheadedAttention(n, h, d_model, att_mask=True)
         self.add_and_norm1 = AddAndNorm(n, d_model)
         self.layer2 = MultiheadedAttention(n, h, d_model)  # cross attention
         self.add_and_norm2 = AddAndNorm(n, d_model)
         self.layer3 = FFN(n, d_model, d_model * 4)
         self.add_and_norm3 = AddAndNorm(n, d_model)
 
-    def forward(self, X):
+
+    def forward(self, X, Y):
         """
         Args:
-        X: tensor of size (BATCH_SZ, N_TGT, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
 
-        Output: tensor of size (BATCH_SZ, N_TGT, D_MODEL)
+        Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
-        self_attention_out = self.add_and_norm1(X, lambda x: self.layer1(x, x, x))
+        self_attention_out = self.add_and_norm1(Y, lambda x: self.layer1(x, x, x))
         cross_attention_out = self.add_and_norm2(
-            self_attention_out, lambda x: self.layer2(x, self.Z_e, self.Z_e)
+            self_attention_out, lambda x: self.layer2(x, X, X)
         )
         ffn_out = self.add_and_norm3(cross_attention_out, lambda x: self.layer3(x))
         return ffn_out
 
 
 class Encoder(nn.Module):
-    def __init__(self, n, h, d_model, num_layers, key_padding_mask):
+    def __init__(self, n, h, d_model, num_layers):
         super(Encoder, self).__init__()
         self.pe = PosEnc(n, d_model)
-        self.encoder_layers = [
-            EncoderLayer(n, h, d_model, key_padding_mask) for i in range(num_layers)
-        ]
+        self.encoder_layers = nn.ModuleList([
+            EncoderLayer(n, h, d_model) for i in range(num_layers)
+        ])
 
     def forward(self, X):
         """
         Args:
-        X: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
 
-        Output: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
-        Z_e = self.pe(X)
+        X = self.pe(X)
         for encoder_layer in self.encoder_layers:
-            Z_e = encoder_layer(Z_e)
-        return Z_e
+            X = encoder_layer(X)
+        return X
 
 
 class Decoder(nn.Module):
-    def __init__(self, n, h, d_model, num_layers, Z_e, key_padding_mask):
+    def __init__(self, n, h, d_model, num_layers):
         """
         Args:
-        Z_e: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
             Represents the output of the encoder
         """
         super(Decoder, self).__init__()
-        self.Z_e = Z_e
         self.pe = PosEnc(n, d_model)
-        self.decoder_layers = [
-            DecoderLayer(n, h, d_model, Z_e, key_padding_mask)
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(n, h, d_model)
             for i in range(num_layers)
-        ]
+        ])
 
-    def forward(self, X):
+    def forward(self, X, Y):
         """
         Args:
-        X: tensor of size (BATCH_SZ, N_TGT, D_MODEL)
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
 
-        Output: tensor of size (BATCH_SZ, N_TGT, D_MODEL)
+        Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
-        Z_d = self.pe(X)
+        Y = self.pe(Y)
         for decoder_layer in self.decoder_layers:
-            Z_d = decoder_layer(Z_d)
-        return Z_d
+            Y = decoder_layer(X, Y)
+        return Y
+
+class Transformer(nn.Module):
+    def __init__(self, n, h, d_model, num_layers):
+        super(Transformer, self).__init__()
+        self.n = n
+        self.h = h
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.encoder = Encoder(n, h, d_model, num_layers)
+        self.decoder = Decoder(self.n, self.h, self.d_model, self.num_layers)
+
+    def forward(self, X, Y):
+        X = self.encoder(X)
+        return self.decoder(X, Y)
 
 
-def tokenize_input(tokens_path, base_path, vocab_path,  d_model):
-    """
-    Args:
-    t_e: list of sentences, with length BATCH_SZ
 
-    Output: tensor of size (BATCH_SZ, N_SRC, D_MODEL)
-        Each sentence is converted into a list of tokens, then padded to the
-        max length of the token lists (N_SRC) , then converted to an embedding
-        of size D_MODEL
-    """
-    with open(tokens_path, "r") as fp:
-        src_tokens = [[int(token) for token in line.split(",")] for line in fp.readlines()]
-    with open(base_path, "r") as fp:
-        src_base = json.load(fp)
-    with open(vocab_path, "r") as fp:
-        src_vocab = json.load(fp)
-    src_tokens = [torch.tensor(sentence) for sentence in src_tokens]
-    max_len = max([sentence.size(0) for sentence in src_tokens])
+def get_batch(src_tokens, blk_sz, batch_sz):
+    idx = torch.randint(len(src_tokens) - blk_sz, (batch_sz,))
+    src_tokens = torch.tensor(src_tokens)
+    X = torch.stack([src_tokens[i: i + blk_sz] for i in idx])
+    Y = torch.stack([src_tokens[i + 1: i + blk_sz + 1] for i in idx])
+    return (X, Y)
 
-    # tensor of size (BATCH_SZ, max_len) where element at (i, j) == 1 if padded else 0
-    key_padding_mask = torch.zeros(len(src_tokens), max_len, dtype=torch.bool)
+def embed(X, Y, vocab_sz, d_model):
+    src_embedding_fn = Embedding(vocab_sz, d_model)
+    return (src_embedding_fn(X), src_embedding_fn(Y))
 
-    # list of size BATCH_SZ of tensors of size (max_len)
-    padded = [torch.zeros((1, max_len), dtype=int) for i in range(len(src_tokens))]
-    for i in range(len(padded)):
-        padded[i][:, : src_tokens[i].size(0)] = src_tokens[i]
-        key_padding_mask[i][src_tokens[i].size(0) - 1 :] = 1
-
-    key_padding_mask = key_padding_mask.unsqueeze(1)
-    key_padding_mask = key_padding_mask.expand(-1, max_len, -1)
-
-    cat = torch.concat(padded)
-
-    src_embedding_fn = Embedding(len(src_vocab) + len(src_base) + 1, d_model)
-    src_embeddings = src_embedding_fn(cat)
-    return (src_embeddings, key_padding_mask)
-
-
-def tokenize_output(tokens_path, base_path, vocab_path, d_model):
-    """
-    Args:
-    t_d: list of sentences, with length BATCH_SZ
-
-    Output: tensor of size (BATCH_SZ, N_TGT, D_MODEL)
-        Each sentence is converted into a list of tokens, then padded to the
-        max length of the token lists (N_SRC) , then converted to an embedding
-        of size D_MODEL
-    """
-    with open(tokens_path) as fp:
-        tgt_tokens = [[int(token) for token in line.split(",")] for line in fp.readlines()]
-    with open(base_path) as fp:
-        tgt_base = json.load(fp)
-    with open(vocab_path) as fp:
-        tgt_vocab = json.load(fp)
-    tgt_tokens = [torch.tensor(sentence) for sentence in tgt_tokens]
-    max_len = max([sentence.size(0) for sentence in tgt_tokens])
-
-    # tensor of size (BATCH_SZ, max_len) where element at (i, j) == 1 if padded else 0
-    key_padding_mask = torch.zeros(len(tgt_tokens), max_len, dtype=torch.bool)
-
-    # list of size BATCH_SZ of tensors of size (max_len)
-    padded = [torch.zeros((1, max_len), dtype=int) for i in range(len(tgt_tokens))]
-    for i in range(len(padded)):
-        padded[i][:, : tgt_tokens[i].size(0)] = tgt_tokens[i]
-        key_padding_mask[i][tgt_tokens[i].size(0) - 1 :] = 1
-
-    key_padding_mask = key_padding_mask.unsqueeze(1)
-    key_padding_mask = key_padding_mask.expand(-1, max_len, -1)
-
-    cat = torch.concat(padded)
-
-    tgt_embedding_fn = Embedding(len(tgt_vocab) + len(tgt_base) + 1, d_model)
-    tgt_embeddings = tgt_embedding_fn(cat)
-    return (tgt_embeddings, key_padding_mask)
-
+def get_loss(Y_hat, Y):
+    return F.cross_entropy(Y_hat, Y)
 
 # TODO(implement)
-def decoder_unembed(Z_d):
-    return Z_d
-
+def decoder_unembed(Y):
+    return Y
 
 if __name__ == "__main__":
-    d_model = 200
+    d_model = 256
+    ctx_sz = 8
+    batch_sz = 4
     h = 8
-    Z_e, key_padding_mask = tokenize_input("./out/tokens_en.txt", "./out/base_en.json", "./out/vocab_en.json", d_model)
-    n_src = max([sentence.size(0) for sentence in Z_e])
-    encoder = Encoder(n_src, h, d_model, 6, key_padding_mask)
-    Z_e = encoder(Z_e)
+    tokens_path = "./out/tokens.txt"
+    base_path = "./out/base.json"
+    vocab_path = "./out/vocab.json"
 
-    Z_d, key_padding_mask = tokenize_output("./out/tokens_fr.txt", "./out/base_fr.json", "./out/vocab_fr.json", d_model)
-    n_tgt = Z_d.size(0)
-    n_tgt = max([sentence.size(0) for sentence in Z_d])
-    decoder = Decoder(n_tgt, h, d_model, 6, Z_e, key_padding_mask)
-    Z_d = decoder(Z_d)
+    lr = 1e-2
+    num_iter = 30
 
-    out = decoder_unembed(Z_d)
-    print("[INFO] final output size: ", out.size())
+    with open(tokens_path, "r") as fp:
+        src_tokens = [int(token) for token in fp.read().split(",")]
+
+    with open(base_path) as fp:
+        base = json.load(fp)
+    with open(vocab_path) as fp:
+        vocab = json.load(fp)
+
+    transformer = Transformer(ctx_sz, h, d_model, 6)
+    adam = torch.optim.AdamW(transformer.parameters(), lr=lr)
+
+    for it in range(num_iter):
+        X, Y = get_batch(src_tokens, ctx_sz, batch_sz)
+
+        X_embedding, Y_embedding = embed(X, Y, len(vocab) + len(base), d_model)
+
+        Y_hat = transformer(X_embedding, Y_embedding)
+
+        B, T, C = Y_hat.size() # dimensions of logit
+        loss = get_loss(Y_hat.view(B*T, C), Y.view(B*T))
+        print("[INFO] loss: ", loss)
+        adam.zero_grad(set_to_none=True)
+        loss.backward()
+        adam.step()
+
+        out = decoder_unembed(Y_hat)
+        if it == num_iter - 1:
+            print("[INFO] final output size: ", out.size())
+
