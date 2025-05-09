@@ -31,6 +31,9 @@ class Embedding(nn.Module):
         self.d_model = d_model
         self.embedding = nn.Embedding(vocab_sz, d_model)
 
+    def weight(self):
+        return self.embedding.weight
+
     def forward(self, X):
         """
         Args:
@@ -39,6 +42,28 @@ class Embedding(nn.Module):
         Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
         return self.embedding(X) * math.sqrt(self.d_model)
+
+
+class Unembedding(nn.Module):
+    def __init__(self, vocab_sz, d_model):
+        super(Unembedding, self).__init__()
+        self.d_model = d_model
+        self.unembedding = nn.Linear(d_model, vocab_sz)
+
+    # Apparently it is beneficial to tie the weights here to the transpose of
+    # the weights of the embedding layer
+    #
+    # See https://paperswithcode.com/paper/using-the-output-embedding-to-improve
+    def forward(self, X, W):
+        """
+        Args:
+        X: tensor of size (BATCH_SZ, N, D_MODEL)
+        W: tensor of size (D_MODEL, VOCAB_SZ)
+
+        Output: tensor of size (BATCH_SZ, N, VOCAB_SZ)
+        """
+        # return self.unembedding(X)
+        return X.matmul(W)
 
 
 class PosEnc(nn.Module):
@@ -60,7 +85,7 @@ class PosEnc(nn.Module):
 
         Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
-        return X + self.dropout(self.PE)
+        return X + self.dropout(X + self.PE[: X.size(-2), : X.size(-1)])
 
 
 class LayerNorm(nn.Module):
@@ -79,7 +104,9 @@ class LayerNorm(nn.Module):
         """
         mean = X.mean(1, keepdim=True)
         var = X.var(1, keepdim=True, unbiased=False)
-        return (X - mean) / torch.sqrt(var + self.eps) * self.alpha + self.beta
+        return (X - mean) / torch.sqrt(var + self.eps) * self.alpha[
+            : X.size(-2), :d_model
+        ] + self.beta[: X.size(-2), :d_model]
 
 
 class ResidualConnection(nn.Module):
@@ -132,13 +159,10 @@ class FFN(nn.Module):
         return self.W2(self.W1(X).relu())
 
 
-# TODO add masking to encoder to skip padding
-# TODO add masking to decoder to skip later tokens
 class MultiheadedAttention(nn.Module):
     def __init__(self, n, h, d_model, att_mask=False):
         """
         Args:
-        key_padding_mask: tensor of size (BATCH_SZ, N, N)
         att_mask: whether or not illegal connections should be masked
             This should be set to True in the decoder self-attention block
         """
@@ -162,11 +186,15 @@ class MultiheadedAttention(nn.Module):
 
         Output: tensor of size (BATCH_SZ, N, D_HEAD)
         """
-        QKT = Q.matmul(K.transpose(1, 2))
+        QKT = Q.matmul(K.transpose(-2, -1))
         if self.att_mask:
-            indices = torch.triu_indices(self.n, self.n, offset=1)
-            QKT[:, indices[0], indices[1]] = float("-inf")
-        return (QKT / math.sqrt(self.d_k)).softmax(dim=2).matmul(V)
+            indices = torch.triu_indices(Q.size(1), Q.size(1), offset=1)
+            if QKT.dim() == 3:
+                QKT[:, indices[0], indices[1]] = float("-inf")
+            elif QKT.dim() == 2:
+                QKT[indices[0], indices[1]] = float("-inf")
+
+        return (QKT / math.sqrt(self.d_k)).softmax(dim=-1).matmul(V)
 
     # NOTE: X_Q = X_K = X_V if self-attention
     def forward(self, X_Q, X_K, X_V):
@@ -182,7 +210,7 @@ class MultiheadedAttention(nn.Module):
         Ks = [self.keys[i](X_K) for i in range(self.h)]
         Vs = [self.values[i](X_V) for i in range(self.h)]
         heads = [self.attention(Q, K, V) for Q, K, V in zip(Qs, Ks, Vs)]
-        res = torch.cat(heads, dim=2)
+        res = torch.cat(heads, dim=-1)
         return res
 
 
@@ -222,7 +250,6 @@ class DecoderLayer(nn.Module):
         self.layer3 = FFN(n, d_model, d_model * 4)
         self.add_and_norm3 = AddAndNorm(n, d_model)
 
-
     def forward(self, X, Y):
         """
         Args:
@@ -242,9 +269,9 @@ class Encoder(nn.Module):
     def __init__(self, n, h, d_model, num_layers):
         super(Encoder, self).__init__()
         self.pe = PosEnc(n, d_model)
-        self.encoder_layers = nn.ModuleList([
-            EncoderLayer(n, h, d_model) for i in range(num_layers)
-        ])
+        self.encoder_layers = nn.ModuleList(
+            [EncoderLayer(n, h, d_model) for i in range(num_layers)]
+        )
 
     def forward(self, X):
         """
@@ -260,7 +287,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, n, h, d_model, num_layers):
+    def __init__(self, n, h, d_model, num_layers, vocab_sz):
         """
         Args:
         X: tensor of size (BATCH_SZ, N, D_MODEL)
@@ -268,56 +295,68 @@ class Decoder(nn.Module):
         """
         super(Decoder, self).__init__()
         self.pe = PosEnc(n, d_model)
-        self.decoder_layers = nn.ModuleList([
-            DecoderLayer(n, h, d_model)
-            for i in range(num_layers)
-        ])
+        self.decoder_layers = nn.ModuleList(
+            [DecoderLayer(n, h, d_model) for i in range(num_layers)]
+        )
+        self.unembedding = Unembedding(vocab_sz, d_model)
 
-    def forward(self, X, Y):
+    def forward(self, X, Y=None):
         """
         Args:
         X: tensor of size (BATCH_SZ, N, D_MODEL)
 
         Output: tensor of size (BATCH_SZ, N, D_MODEL)
         """
-        Y = self.pe(Y)
+        Y = X.clone() if Y is None else self.pe(Y)
         for decoder_layer in self.decoder_layers:
             Y = decoder_layer(X, Y)
         return Y
 
+    def unembed(self, X, W):
+        return self.unembedding(X, W)
+
+
 class Transformer(nn.Module):
-    def __init__(self, n, h, d_model, num_layers):
+    def __init__(self, n, h, d_model, num_layers, vocab_sz):
         super(Transformer, self).__init__()
-        self.n = n
-        self.h = h
-        self.d_model = d_model
-        self.num_layers = num_layers
         self.encoder = Encoder(n, h, d_model, num_layers)
-        self.decoder = Decoder(self.n, self.h, self.d_model, self.num_layers)
+        self.decoder = Decoder(n, h, d_model, num_layers, vocab_sz)
+        self.tokenizer = Tokenizer("")
+        self.vocab_sz = vocab_sz
+        self.d_model = d_model
+        self.embedding = Embedding(vocab_sz, d_model)
 
-    def forward(self, X, Y):
-        X = self.encoder(X)
-        return self.decoder(X, Y)
+    def forward(self, X, Y=None):
+        X_embedding = self.embedding(X)
+        Y_embedding = self.embedding(Y) if Y is not None else Y
+        X_embedding = self.encoder(X_embedding)
+        return self.decoder(X_embedding, Y_embedding)
 
+    def generate(self, cur_tokens, seq_len, vocab_sz, d_model, blk_sz):
+        for _ in range(seq_len):
+            if cur_tokens.size(1) > blk_sz:
+                cur_tokens = cur_tokens[:, -blk_sz:]
+            Y_hat = self(cur_tokens)
+            Y_hat = self.decoder.unembed(Y_hat, self.embedding.weight().transpose(0, 1))[:, -1, :]
+
+            probs = F.softmax(Y_hat, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            print(self.tokenizer.decode([next_token[0][0].item()], base, vocab), end="")
+            cur_tokens = torch.cat((cur_tokens, next_token), dim=1)
+        print("")
 
 
 def get_batch(src_tokens, blk_sz, batch_sz):
     idx = torch.randint(len(src_tokens) - blk_sz, (batch_sz,))
     src_tokens = torch.tensor(src_tokens)
-    X = torch.stack([src_tokens[i: i + blk_sz] for i in idx])
-    Y = torch.stack([src_tokens[i + 1: i + blk_sz + 1] for i in idx])
+    X = torch.stack([src_tokens[i : i + blk_sz] for i in idx])
+    Y = torch.stack([src_tokens[i + 1 : i + blk_sz + 1] for i in idx])
     return (X, Y)
 
-def embed(X, Y, vocab_sz, d_model):
-    src_embedding_fn = Embedding(vocab_sz, d_model)
-    return (src_embedding_fn(X), src_embedding_fn(Y))
 
 def get_loss(Y_hat, Y):
     return F.cross_entropy(Y_hat, Y)
 
-# TODO(implement)
-def decoder_unembed(Y):
-    return Y
 
 if __name__ == "__main__":
     d_model = 256
@@ -329,34 +368,40 @@ if __name__ == "__main__":
     vocab_path = "./out/vocab.json"
 
     lr = 1e-2
-    num_iter = 30
+    num_iter = 100
 
     with open(tokens_path, "r") as fp:
         src_tokens = [int(token) for token in fp.read().split(",")]
 
     with open(base_path) as fp:
-        base = json.load(fp)
+        base = {int(k): v for k, v in json.load(fp).items()}
     with open(vocab_path) as fp:
-        vocab = json.load(fp)
+        vocab = {int(k): v for k, v in json.load(fp).items()}
 
-    transformer = Transformer(ctx_sz, h, d_model, 6)
+    transformer = Transformer(ctx_sz, h, d_model, 6, len(base) + len(vocab))
     adam = torch.optim.AdamW(transformer.parameters(), lr=lr)
 
     for it in range(num_iter):
         X, Y = get_batch(src_tokens, ctx_sz, batch_sz)
 
-        X_embedding, Y_embedding = embed(X, Y, len(vocab) + len(base), d_model)
+        Y_hat = transformer(X, Y)
 
-        Y_hat = transformer(X_embedding, Y_embedding)
-
-        B, T, C = Y_hat.size() # dimensions of logit
-        loss = get_loss(Y_hat.view(B*T, C), Y.view(B*T))
+        B, T, C = Y_hat.size()  # dimensions of logit
+        loss = get_loss(Y_hat.view(B * T, C), Y.view(B * T))
         print("[INFO] loss: ", loss)
         adam.zero_grad(set_to_none=True)
         loss.backward()
         adam.step()
 
-        out = decoder_unembed(Y_hat)
+        out = transformer.decoder.unembed(Y_hat, transformer.embedding.weight().transpose(0, 1))
         if it == num_iter - 1:
             print("[INFO] final output size: ", out.size())
 
+    tokenizer = Tokenizer("")
+    transformer.generate(
+        torch.tensor([[0]], dtype=torch.long),
+        100,
+        len(vocab) + len(base),
+        d_model,
+        ctx_sz,
+    )
