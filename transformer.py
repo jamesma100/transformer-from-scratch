@@ -341,7 +341,7 @@ class Transformer(nn.Module):
 
             probs = F.softmax(Y_hat, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            print(self.tokenizer.decode([next_token[0][0].item()], base, vocab), end="")
+            print(self.tokenizer.decode([next_token[0][0].item()], base, vocab), end="", flush=True)
             cur_tokens = torch.cat((cur_tokens, next_token), dim=1)
         print("")
 
@@ -359,7 +359,7 @@ def get_loss(Y_hat, Y):
 
 
 if __name__ == "__main__":
-    d_model = 256
+    d_model = 128
     ctx_sz = 8
     batch_sz = 4
     h = 8
@@ -367,8 +367,8 @@ if __name__ == "__main__":
     base_path = "./out/base.json"
     vocab_path = "./out/vocab.json"
 
-    lr = 1e-2
-    num_iter = 100
+    lr = 1e-3
+    num_iter = 1000
 
     with open(tokens_path, "r") as fp:
         src_tokens = [int(token) for token in fp.read().split(",")]
@@ -378,6 +378,10 @@ if __name__ == "__main__":
     with open(vocab_path) as fp:
         vocab = {int(k): v for k, v in json.load(fp).items()}
 
+    print("[INFO] total vocab size: ", len(base) + len(vocab))
+    print("[INFO] B: ", batch_sz)
+    print("[INFO] C: ", ctx_sz)
+    print("[INFO] d_model: ", d_model)
     transformer = Transformer(ctx_sz, h, d_model, 6, len(base) + len(vocab))
     adam = torch.optim.AdamW(transformer.parameters(), lr=lr)
 
@@ -385,6 +389,7 @@ if __name__ == "__main__":
         X, Y = get_batch(src_tokens, ctx_sz, batch_sz)
 
         Y_hat = transformer(X, Y)
+        Y_hat = transformer.decoder.unembed(Y_hat, transformer.embedding.weight().transpose(0, 1))
 
         B, T, C = Y_hat.size()  # dimensions of logit
         loss = get_loss(Y_hat.view(B * T, C), Y.view(B * T))
@@ -393,14 +398,13 @@ if __name__ == "__main__":
         loss.backward()
         adam.step()
 
-        out = transformer.decoder.unembed(Y_hat, transformer.embedding.weight().transpose(0, 1))
         if it == num_iter - 1:
-            print("[INFO] final output size: ", out.size())
+            print("[INFO] final output size: ", Y_hat.size())
 
     tokenizer = Tokenizer("")
     transformer.generate(
         torch.tensor([[0]], dtype=torch.long),
-        100,
+        10000,
         len(vocab) + len(base),
         d_model,
         ctx_sz,
