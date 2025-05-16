@@ -1,5 +1,8 @@
 import pandas as pd
 import json
+import os
+import sys
+
 
 class Tokenizer:
     def __init__(self, text):
@@ -14,12 +17,14 @@ class Tokenizer:
         freq = {}
         sz = len(tokens)
         for i in range(sz - 1):
-            pair = (tokens[i], tokens[i+1])
+            pair = (tokens[i], tokens[i + 1])
             freq[pair] = freq.get(pair, 0) + 1
 
-        top_pairs = sorted(list([k, v] for k, v in freq.items()), key=lambda x:x[1], reverse=True)
+        top_pairs = sorted(
+            list([k, v] for k, v in freq.items()), key=lambda x: x[1], reverse=True
+        )
         return top_pairs[0][0] if top_pairs and top_pairs[0][1] > 1 else None
-    
+
     def _replace(self, tokens, reverse):
         """
         Reverse all unicode code points with their equivalent token idx
@@ -31,7 +36,7 @@ class Tokenizer:
                 raise AssertionError("Error: token not in reverse mapping.")
             cp.append(reverse[token])
         return cp
-    
+
     def _init_vocab(self, tokens):
         """
         Initialize vocabulary with all distinct unicode characters that appear
@@ -56,7 +61,7 @@ class Tokenizer:
         sz = len(tokens)
         i = 0
         while i < sz - 1:
-            pair = (tokens[i], tokens[i+1])
+            pair = (tokens[i], tokens[i + 1])
             if pair == top_pair:
                 cp.append(next_idx)
                 i += 2
@@ -66,13 +71,13 @@ class Tokenizer:
         if i == sz - 1:
             cp.append(tokens[sz - 1])
         return cp
-    
+
     def _get_freq(self, tokens):
         freq = {}
         for i in tokens:
             freq[i] = freq.get(i, 0) + 1
         return freq
-    
+
     def _find_symbol(self, base, vocab, key):
         """
         Returns list of unicode code points representing some token "key"
@@ -81,23 +86,22 @@ class Tokenizer:
             return [base[key]]
         fst, snd = vocab[key]
         return self._find_symbol(base, vocab, fst) + self._find_symbol(base, vocab, snd)
-    
+
     def print_vocab(self, base, vocab):
         """
         Recursively resolve each entry in vocab and print its associated string
         """
-        print("[INFO] printing generated vocab:")
+        print("[INFO] printing generated vocab...")
         keys = sorted(vocab.keys())
         for key in keys:
             symbol = self._find_symbol(base, vocab, key)
             displ = "{} => |{}|".format(
                 str(key).ljust(3),
-                ''.join([(chr(c) if c != 10 else "\\n") for c in symbol])
+                "".join([(chr(c) if c != 10 else "\\n") for c in symbol]),
             )
             print(displ)
-    
-    
-    def encode(self, max_len=100):
+
+    def encode(self, max_len=400):
         tokens = [ord(c) for c in self.text]
         base, reverse = self._init_vocab(tokens)
         tokens = self._replace(tokens, reverse)
@@ -112,16 +116,21 @@ class Tokenizer:
             vocab[next_idx] = top_pair
             tokens = self._merge(tokens, top_pair, next_idx)
             next_idx += 1
+            print(f"[INFO] iteration: {i}, vocab size: {len(vocab)}")
             i += 1
         final_token_count = len(tokens)
-        print("[INFO] BPE compression ratio: {}".format(1 - final_token_count / initial_token_count))
+        print(
+            f"[INFO] BPE compression ratio: {(1 - initial_token_count / final_token_count)}"
+        )
         return (tokens, base, vocab)
-    
+
     def _decode_token(self, token, base, vocab):
         if token in base:
             return [chr(base[token])]
         lookup = vocab[token]
-        return self._decode_token(lookup[0], base, vocab) + self._decode_token(lookup[1], base, vocab)
+        return self._decode_token(lookup[0], base, vocab) + self._decode_token(
+            lookup[1], base, vocab
+        )
 
     def decode(self, tokens, base, vocab):
         res = []
@@ -131,14 +140,27 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    filepath = "./data/samurai_champloo/Samurai.Champloo.2004.E02.720p.BDRip.XviD.AC3-ViSiON.srt_cleaned"
-    with open(filepath, "r") as fp:
-        content = fp.read()
+    if len(sys.argv) != 3:
+        print("Usage: python3 tokenizer.py <directory path> <vocab size>")
+        sys.exit(1)
+
+    dirpath = sys.argv[1]
+    vocab_sz = int(sys.argv[2])
+    file_contents = []
+
+    for root, _, files in os.walk(dirpath):
+        for file in files:
+            with open(os.path.join(root, file), "r") as fp:
+                data = fp.read()
+                file_contents.append(data)
+    content = " ".join(file_contents)
 
     tokenizer = Tokenizer(content)
-    tokens, base, vocab = tokenizer.encode()
+    tokens, base, vocab = tokenizer.encode(max_len=vocab_sz)
     decoded = tokenizer.decode(tokens, base, vocab)
     assert decoded == content
+    print(f"[INFO] final vocab size: {len(vocab)}")
+    tokenizer.print_vocab(base, vocab)
 
     with open("./out/tokens.txt", "w+") as fp:
         fp.write(",".join([str(token) for token in tokens]))
