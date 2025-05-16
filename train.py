@@ -16,7 +16,7 @@ if __name__ == "__main__":
         src_tokens = [int(token) for token in fp.read().split(",")]
 
     data_sz = len(src_tokens)
-    split = int(data_sz * 0.01)
+    split = int(data_sz * 0.7)
 
     train, test = src_tokens[:split], src_tokens[split:]
 
